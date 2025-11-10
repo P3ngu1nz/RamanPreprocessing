@@ -1,0 +1,18 @@
+def als_baseline_correction(y, lam=1e5, p=0.001, niter=10):
+    import numpy as np
+    from scipy import sparse
+    from scipy.sparse.linalg import spsolve
+    y = np.atleast_2d(y)
+    n_spectra, L = y.shape
+    corrected = np.zeros_like(y)
+    for i in range(n_spectra):
+        yi = y[i]
+        D = sparse.diags([1, -2, 1], [0, -1, -2], shape=(L, L-2))
+        w = np.ones(L)
+        for _ in range(niter):
+            W = sparse.spdiags(w, 0, L, L)
+            Z = W + lam * D.dot(D.transpose())
+            z = spsolve(Z, w * yi)
+            w = p * (yi > z) + (1 - p) * (yi <= z)
+        corrected[i] = yi - z
+    return corrected if n_spectra > 1 else corrected.squeeze(),z
