@@ -1,0 +1,60 @@
+import pywt
+import numpy as np
+import matplotlib.pyplot as plt
+
+import numpy as np
+from scipy.signal import find_peaks, peak_widths, peak_prominences
+from scipy import interpolate
+
+def spike_removal(y, 
+                  width_threshold, 
+                  prominence_threshold=None, 
+                  moving_average_window=10, 
+                  width_param_rel=0.8, 
+                  interp_type='linear'):
+    """
+    Detects and replaces spikes in the input spectrum with interpolated values. Algorithm first 
+    published by N. Coca-Lopez in Analytica Chimica Acta. https://doi.org/10.1016/j.aca.2024.342312
+
+    Parameters:
+    y (numpy.ndarray): Input spectrum intensity.
+    width_threshold (float): Threshold for peak width.
+    prominence_threshold (float): Threshold for peak prominence.
+    moving_average_window (int): Number of points in moving average window.
+    width_param_rel (float): Relative height parameter for peak width.
+    tipo: type of interpolation (linear, quadratic, cubic)
+    
+    Returns:
+    numpy.ndarray: Signal with spikes replaced by interpolated values.
+    """
+
+    # First, we find all peaks showing a prominence above prominence_threshold on the spectra
+    peaks, _ = find_peaks(y, prominence=prominence_threshold)
+    
+    # Create a vector where spikes will be flag: no spike = 0, spike = 1.
+    spikes = np.zeros(len(y))
+    
+    # Calculation of the widths of the found peaks
+    widths = peak_widths(y, peaks)[0]
+    
+    # Calculation of the range where the spectral points are asumed to be corrupted
+    widths_ext_a = peak_widths(y, peaks, rel_height=width_param_rel)[2]
+    widths_ext_b = peak_widths(y, peaks, rel_height=width_param_rel)[3]
+    
+    # Flagging the area previously defined if the peak is considered a spike (width below width_threshold)
+    for a, width, ext_a, ext_b in zip(range(len(widths)), widths, widths_ext_a, widths_ext_b):
+        if width < width_threshold:
+            spikes[int(ext_a) - 1: int(ext_b) + 2] = 1 
+            
+    y_out = y.copy()
+    
+    # Interpolation of corrupted points
+    for i, spike in enumerate(spikes):
+        if spike != 0: # If we have an spike in position i
+            window = np.arange(i - moving_average_window, i + moving_average_window + 1) # we select 2 ma + 1 points around our spike
+            window_exclude_spikes = window[spikes[window] == 0] # From such interval, we choose the ones which are not spikes
+            interpolator = interpolate.interp1d(window_exclude_spikes, y[window_exclude_spikes], kind=interp_type) # We use the not corrupted points around the spike to calculate the interpolation
+            y_out[i] = interpolator(i) # The corrupted point is exchanged by the interpolated value.
+            
+    return y_out
+
