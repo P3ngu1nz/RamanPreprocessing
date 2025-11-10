@@ -1,0 +1,198 @@
+import pywt
+import numpy as np
+import matplotlib.pyplot as plt
+
+import numpy as np
+from scipy.signal import find_peaks, peak_widths, peak_prominences
+from scipy import interpolate
+
+def spike_removal(y, 
+                  width_threshold, 
+                  prominence_threshold=None, 
+                  moving_average_window=10, 
+                  width_param_rel=0.8, 
+                  interp_type='linear'):
+    """
+    Detects and replaces spikes in the input spectrum with interpolated values. Algorithm first 
+    published by N. Coca-Lopez in Analytica Chimica Acta. https://doi.org/10.1016/j.aca.2024.342312
+
+    Parameters:
+    y (numpy.ndarray): Input spectrum intensity.
+    width_threshold (float): Threshold for peak width.
+    prominence_threshold (float): Threshold for peak prominence.
+    moving_average_window (int): Number of points in moving average window.
+    width_param_rel (float): Relative height parameter for peak width.
+    tipo: type of interpolation (linear, quadratic, cubic)
+    
+    Returns:
+    numpy.ndarray: Signal with spikes replaced by interpolated values.
+    """
+
+    # First, we find all peaks showing a prominence above prominence_threshold on the spectra
+    peaks, _ = find_peaks(y, prominence=prominence_threshold)
+    
+    # Create a vector where spikes will be flag: no spike = 0, spike = 1.
+    spikes = np.zeros(len(y))
+    
+    # Calculation of the widths of the found peaks
+    widths = peak_widths(y, peaks)[0]
+    
+    # Calculation of the range where the spectral points are asumed to be corrupted
+    widths_ext_a = peak_widths(y, peaks, rel_height=width_param_rel)[2]
+    widths_ext_b = peak_widths(y, peaks, rel_height=width_param_rel)[3]
+    
+    # Flagging the area previously defined if the peak is considered a spike (width below width_threshold)
+    for a, width, ext_a, ext_b in zip(range(len(widths)), widths, widths_ext_a, widths_ext_b):
+        if width < width_threshold:
+            spikes[int(ext_a) - 1: int(ext_b) + 2] = 1 
+            
+    y_out = y.copy()
+    
+    # Interpolation of corrupted points
+    for i, spike in enumerate(spikes):
+        if spike != 0: # If we have an spike in position i
+            window = np.arange(i - moving_average_window, i + moving_average_window + 1) # we select 2 ma + 1 points around our spike
+            window_exclude_spikes = window[spikes[window] == 0] # From such interval, we choose the ones which are not spikes
+            interpolator = interpolate.interp1d(window_exclude_spikes, y[window_exclude_spikes], kind=interp_type) # We use the not corrupted points around the spike to calculate the interpolation
+            y_out[i] = interpolator(i) # The corrupted point is exchanged by the interpolated value.
+            
+    return y_out
+
+def wavelet_denoise(spectra, normalize=False, wavelet='db3', level=3, thr_mode='soft', 
+                    selected_level=None, method="universal", resolution=100, energy_perc=0.90,
+                    boundary_mode='symmetric'):
+    """
+    Denoise multiple Raman spectra using discrete wavelet transform with PyWavelets.
+    Modified to handle boundary effects: uses symmetric mode by default to reduce edge artifacts,
+    caps decomposition levels to max possible, and provides warnings for potential boundary distortions.
+    
+    Parameters:
+    - spectra (np.ndarray): 2D array of shape (n_spectra, n_points) where each row is a spectrum.
+    - normalize (bool, default=False): If True, normalizes each spectrum to zero mean and unit variance before denoising. Helps standardize data but may not be needed for all Raman spectra.
+    - wavelet (str, default='db3'): Wavelet family for decomposition (e.g., 'db3' for Daubechies with 3 vanishing moments). Options: 'db' (Daubechies), 'sym' (Symlets), 'coif' (Coiflets), 'haar'. Affects how well wavelets capture sharp Raman peaks; 'db3' or 'sym3' are good for typical spectra.
+    - level (int, default=3): Number of decomposition levels. Higher levels capture more low-frequency components (e.g., baseline) but risk over-smoothing. Use 3-5 for typical Raman spectra (1024-4096 points).
+    - thr_mode (str, default='soft'): Thresholding mode. 'soft' subtracts threshold from coefficients (smoother results); 'hard' sets coefficients below threshold to zero (preserves edges, may introduce artifacts). 'soft' is preferred for Raman noise reduction.
+    - selected_level (int, list of int, or None, default=None): Decomposition level(s) to threshold. If None, applies to all detail levels (1 to level). Use specific levels (e.g., [1,2]) to target high-frequency noise.
+    - method (str, default="universal"): Threshold calculation method. 'universal' uses VisuShrink (sigma * sqrt(2 * log(N))), where sigma is noise estimate and N is spectrum length—suitable for Gaussian noise. 'energy' thresholds to retain energy_perc of cumulative energy in detail coefficients, useful for compression-like denoising.
+    - resolution (int, default=100): Placeholder for assumed spectral resolution (e.g., for optional resampling). Not used in core denoising here but could be applied for post-processing (e.g., interpolating to this resolution). Kept for compatibility.
+    - energy_perc (float, default=0.90): Percentage of total energy to retain (0.0 to 1.0) when method='energy'. Sorts detail coefficients by magnitude and thresholds to keep this energy fraction. Ignored for other methods.
+    - boundary_mode (str, default='symmetric'): Boundary handling mode for wavelet decomposition/reconstruction. 'symmetric' mirrors edges to minimize artifacts; 'periodization' assumes periodicity (may introduce wrap-around effects); 'zero' pads with zeros (sharp discontinuities). 'symmetric' reduces boundary distortions in non-periodic spectra.
+    
+    Returns:
+    - denoised_spectra (np.ndarray): Denoised spectra, same shape as input.
+    - edge_warnings (list of str): Per-spectrum warnings about boundary effects (e.g., if signal too short).
+    - reliable_masks (list of np.ndarray): Per-spectrum boolean masks indicating reliable (non-edge-affected) positions.
+    """
+    # Ensure input is 2D
+    spectra = np.atleast_2d(spectra)
+    n_spectra, n_points = spectra.shape
+    denoised_spectra = np.zeros_like(spectra)
+    edge_warnings = []
+    reliable_masks = []
+    
+    w = pywt.Wavelet(wavelet)
+    filter_len = w.dec_len
+    edge_width = filter_len // 2
+    max_level = pywt.dwt_max_level(n_points, filter_len)
+    
+    if level > max_level:
+        print(f"Warning: Requested level {level} > max possible {max_level}; capping to {max_level} to minimize boundary corruption.")
+        level = max_level
+    
+    # Global reliable mask template (same for all spectra assuming fixed length)
+    reliable_mask_template = np.ones(n_points, dtype=bool)
+    reliable_mask_template[:edge_width] = False
+    reliable_mask_template[-edge_width:] = False
+    
+    if n_points < 2 * filter_len:
+        global_warning = f"Short spectra detected: {n_points} pts. Boundary effects may corrupt >{100 * (2*edge_width)/n_points:.1f}% of data. Consider padding or changing boundary_mode."
+        print(f"Global Edge Warning: {global_warning}")
+    
+    for i in range(n_spectra):
+        signal = spectra[i]
+        
+        # Normalize if requested
+        norm_params = {}
+        if normalize:
+            mean = np.mean(signal)
+            std = np.std(signal)
+            norm_params = {'mean': mean, 'std': std}
+            signal = (signal - mean) / std if std != 0 else signal
+        
+        # Perform multilevel decomposition
+        coeffs = pywt.wavedec(signal, wavelet, mode=boundary_mode, level=level)
+        
+        # Estimate noise standard deviation from finest detail level
+        sigma = np.median(np.abs(coeffs[-1] - np.median(coeffs[-1]))) / 0.6745
+        
+        # Determine levels to threshold
+        if selected_level is None:
+            levels_to_thresh = list(range(1, len(coeffs)))
+        else:
+            levels_to_thresh = [selected_level] if isinstance(selected_level, int) else selected_level
+        
+        # Calculate threshold
+        if method == "universal":
+            thresh = sigma * np.sqrt(2 * np.log(len(signal)))
+            for lvl in levels_to_thresh:
+                coeffs[lvl] = pywt.threshold(coeffs[lvl], thresh, mode=thr_mode)
+        
+        elif method == "energy":
+            detail_coeffs = np.concatenate([c for c in coeffs[1:]])
+            abs_coeffs = np.sort(np.abs(detail_coeffs))[::-1]
+            energy = abs_coeffs ** 2
+            cum_energy = np.cumsum(energy) / np.sum(energy)
+            idx = np.argmax(cum_energy >= energy_perc)
+            thresh = abs_coeffs[idx] if idx < len(abs_coeffs) else 0
+            for lvl in levels_to_thresh:
+                coeffs[lvl] = pywt.threshold(coeffs[lvl], thresh, mode=thr_mode)
+        
+        else:
+            raise ValueError(f"Unsupported method: {method}. Use 'universal' or 'energy'.")
+        
+        # Reconstruct the signal
+        denoised = pywt.waverec(coeffs, wavelet, mode=boundary_mode)
+        
+        # Trim or pad to match input length (due to wavelet boundary effects)
+        if len(denoised) > n_points:
+            denoised = denoised[:n_points]
+        elif len(denoised) < n_points:
+            denoised = np.pad(denoised, (0, n_points - len(denoised)), mode='edge')
+        
+        # Reverse normalization
+        if normalize:
+            denoised = denoised * norm_params['std'] + norm_params['mean']
+        
+        denoised_spectra[i] = denoised
+        
+        # Per-spectrum edge info
+        spectrum_warning = f"Spectrum {i}: Reliable positions: {np.sum(reliable_mask_template)} / {n_points} ({100 * np.sum(reliable_mask_template)/n_points:.1f}%). Edge zones (~{edge_width} pts each end) may have artifacts."
+        edge_warnings.append(spectrum_warning)
+        reliable_masks.append(reliable_mask_template.copy())  # Same for all if fixed length
+    
+    # Print warnings
+    for warn in edge_warnings:
+        print(warn)
+    
+    return denoised_spectra, edge_warnings, reliable_masks
+
+
+def als_baseline_correction(y, lam=1e5, p=0.001, niter=10):
+    import numpy as np
+    from scipy import sparse
+    from scipy.sparse.linalg import spsolve
+    y = np.atleast_2d(y)
+    n_spectra, L = y.shape
+    corrected = np.zeros_like(y)
+    for i in range(n_spectra):
+        yi = y[i]
+        D = sparse.diags([1, -2, 1], [0, -1, -2], shape=(L, L-2))
+        w = np.ones(L)
+        for _ in range(niter):
+            W = sparse.spdiags(w, 0, L, L)
+            Z = W + lam * D.dot(D.transpose())
+            z = spsolve(Z, w * yi)
+            w = p * (yi > z) + (1 - p) * (yi <= z)
+        corrected[i] = yi - z
+    return corrected if n_spectra > 1 else corrected.squeeze(),z
+
